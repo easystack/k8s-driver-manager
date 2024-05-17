@@ -9,7 +9,7 @@ Usage: $0 COMMAND [ARG...]
 
  Commands:
    bind   [-a | --all] [-d | --device-id]
-   unbind [-a | --all] [-d | --device-id]
+   unbind [-a | --all] [-d | --device-id] [-n | --all-to-nvidia]
    help [-h]
 EOF
     exit 0
@@ -19,12 +19,20 @@ unbind_from_driver() {
     local gpu=$1
     local existing_driver_name
     local existing_driver
+
     [ -e "/sys/bus/pci/devices/$gpu/driver" ] || return 0
+
     existing_driver=$(readlink -f "/sys/bus/pci/devices/$gpu/driver")
     existing_driver_name=$(basename "$existing_driver")
+
     echo "unbinding device $gpu from driver $existing_driver_name"
     echo "$gpu" > "$existing_driver/unbind"
     echo > /sys/bus/pci/devices/$gpu/driver_override
+
+    if [ "$ALL_TO_NVIDIA" == "true" ]; then
+      echo "nvidia" > /sys/bus/pci/devices/$gpu/driver_override
+      echo "$gpu" > /sys/bus/pci/drivers_probe
+    fi
 }
 
 # unbind device from non vfio-pci driver
@@ -32,14 +40,26 @@ unbind_from_other_driver() {
     local gpu=$1
     local existing_driver_name
     local existing_driver
+
     [ -e "/sys/bus/pci/devices/$gpu/driver" ] || return 0
+
     existing_driver=$(readlink -f "/sys/bus/pci/devices/$gpu/driver")
     existing_driver_name=$(basename "$existing_driver")
+
     # return if bound to vfio-pci
     [ "$existing_driver_name" != "vfio-pci" ] || return 0
     echo "unbinding device $gpu from driver $existing_driver_name"
     echo "$gpu" > "$existing_driver/unbind"
     echo > /sys/bus/pci/devices/$gpu/driver_override
+}
+
+is_nvidia_gpu_device() {
+    local gpu=$1
+    # make sure device class is for NVIDIA GPU
+    device_class_file=$(readlink -f "/sys/bus/pci/devices/$gpu/class")
+    device_class=$(cat "$device_class_file")
+    [ "$device_class" == "0x030200" ] || [ "$device_class" == "0x030000" ] || return 1
+    return 0
 }
 
 is_bound_to_vfio() {
@@ -61,9 +81,13 @@ is_bound_to_vfio() {
     return 0
 }
 
-
 unbind_device() {
     local gpu=$1
+
+    if ! is_nvidia_gpu_device $gpu; then
+        return 0
+    fi
+
     echo "unbinding device $gpu"
     unbind_from_driver $gpu
 }
@@ -80,6 +104,11 @@ unbind_all() {
 
 bind_device() {
     local gpu=$1
+
+    if ! is_nvidia_gpu_device $gpu; then
+        return 0
+    fi
+
     if ! is_bound_to_vfio $gpu; then
       unbind_from_other_driver $gpu
       echo "binding device $gpu"
@@ -101,6 +130,12 @@ bind_all() {
 }
 
 handle_bind() {
+    check=`lsmod | grep vfio`
+    if [ -z "$check" ]; then
+    	  modprobe vfio-pci
+    	  echo "vfio-pci" > /etc/modules-load.d/vfio.conf
+    fi
+
     if [ "$DEVICE_ID" != "" ]; then
         bind_device $DEVICE_ID
     elif [ "$ALL_DEVICES" = "true" ]; then
@@ -113,7 +148,7 @@ handle_bind() {
 handle_unbind() {
     if [ "$DEVICE_ID" != "" ]; then
         unbind_device $DEVICE_ID
-    elif [ "$ALL_DEVICES" = "true" ]; then
+    elif [ "$ALL_DEVICES" = "true" ] || [ "$ALL_TO_NVIDIA" = "true" ]; then
         unbind_all
     else
         usage
@@ -127,7 +162,7 @@ fi
 command=$1; shift
 case "${command}" in
     bind) options=$(getopt -o ad: --long all,device-id: -- "$@");;
-    unbind) options=$(getopt -o ad: --long all,device-id: -- "$@");;
+    unbind) options=$(getopt -o adn: --long all,device-id,all-to-nvidia: -- "$@");;
     help) options="" ;;
     *) usage ;;
 esac
@@ -137,11 +172,14 @@ fi
 
 eval set -- "${options}"
 
+ALL_DEVICES=false
 DEVICE_ID=""
+ALL_TO_NVIDIA=false
 for opt in ${options}; do
     case "$opt" in
     -a | --all) ALL_DEVICES=true; shift 1 ;;
     -d | --device-id) DEVICE_ID=$2; shift 2 ;;
+    -n | --all-to-nvidia) ALL_TO_NVIDIA=true; shift 2;;
     -h | --help) shift;;
     --) shift; break ;;
     esac
