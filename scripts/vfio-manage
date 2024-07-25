@@ -27,12 +27,13 @@ unbind_from_driver() {
 
     echo "unbinding device $gpu from driver $existing_driver_name"
     echo "$gpu" > "$existing_driver/unbind"
-    echo > /sys/bus/pci/devices/$gpu/driver_override
 
     if [ "$ALL_TO_NVIDIA" == "true" ]; then
       echo "nvidia" > /sys/bus/pci/devices/$gpu/driver_override
-      echo "$gpu" > /sys/bus/pci/drivers_probe
+      echo "$gpu" > /sys/bus/pci/drivers/nvidia/bind
     fi
+
+    echo > /sys/bus/pci/devices/$gpu/driver_override
 }
 
 # unbind device from non vfio-pci driver
