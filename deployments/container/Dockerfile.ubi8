@@ -16,7 +16,7 @@ ARG CUDA_VERSION
 ARG BASE_DIST
 ARG GOLANG_VERSION=1.20.2
 
-FROM golang:${GOLANG_VERSION} AS build
+FROM hub.easystack.cn/library/golang:${GOLANG_VERSION} AS build
 
 WORKDIR /work
 
@@ -27,7 +27,7 @@ COPY cmd/nvdrain cmd/nvdrain
 
 RUN GOOS=linux go build -o nvdrain ./cmd/nvdrain
 
-FROM nvidia/cuda:${CUDA_VERSION}-base-${BASE_DIST}
+FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-base-${BASE_DIST}
 
 ARG TARGETARCH
 ARG KUBERNETES_VERSION="v1.28.2"
