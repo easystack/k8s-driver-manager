@@ -314,6 +314,27 @@ _evict_all_gpu_operator_components() {
         return 1
     fi
 
+    echo "Shutting down gpu-config-daemon by disabling their component-specific nodeSelector labels in NodeFeatureRule"
+    cat <<EOF | kubectl apply -f -
+apiVersion: nfd.k8s-sigs.io/v1alpha1
+kind: NodeFeatureRule
+metadata:
+  name: gpu-driver-${NODE_NAME}
+spec:
+  rules:
+  - name: "gpu driver"
+    labels:
+      ecns.easystack.io/gpu.driver: paused-for-driver-switch
+    matchFeatures:
+    - feature: system.name
+      matchExpressions:
+        nodename: {op: In, value: ["${NODE_NAME}"]}
+EOF
+
+    if [ "$?" != "0" ]; then
+        return 1
+    fi
+
     # check if a custom operand node selector label is provided for eviction
     if [ "${CUSTOM_OPERAND_NODE_LABEL_VALUE}" != "" ]; then
         echo "Shutting down GPU clients using node selector label ${NODE_LABEL_FOR_GPU_POD_EVICTION}=${CUSTOM_OPERAND_NODE_LABEL_VALUE}"
@@ -411,6 +432,13 @@ _evict_all_gpu_operator_components() {
             -n ${OPERATOR_NAMESPACE} \
             -l app=nvidia-vgpu-device-manager
     fi
+
+    echo "Waiting for gpu-config-daemon to shutdown"
+    kubectl wait --for=delete pod \
+        --timeout=5m \
+        --field-selector "spec.nodeName=${NODE_NAME}" \
+        -n "${OPERATOR_NAMESPACE}" \
+        -l component=gpu-config-daemon
 
 
     return 0
