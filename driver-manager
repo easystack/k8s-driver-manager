@@ -39,6 +39,7 @@ VGPU_DEVICE_MANAGER_DEPLOYED=""
 NODE_LABEL_FOR_GPU_POD_EVICTION=$(echo ${NODE_LABEL_FOR_GPU_POD_EVICTION} | sed -e "s/=.*$//g")
 CUSTOM_OPERAND_NODE_LABEL_VALUE=""
 AUTO_UPGRADE_POLICY_ENABLED=""
+CURRENT_WORKLOAD_CONFIG=""
 GPU_DIRECT_RDMA_ENABLED=${GPU_DIRECT_RDMA_ENABLED:-"false"}
 USE_HOST_MOFED=${USE_HOST_MOFED:-"false"}
 
@@ -92,6 +93,21 @@ _is_driver_auto_upgrade_policy_enabled() {
     fi
     echo "Auto upgrade policy of the GPU driver on the node ${NODE_NAME} is disabled"
     return 1
+}
+
+_is_vm_passthrough_enabled() {
+    if [ "${CURRENT_WORKLOAD_CONFIG}" = "vm-passthrough" ]; then
+        return 0
+    fi
+    echo "Current workload config of the GPU on the node ${NODE_NAME} is ${CURRENT_WORKLOAD_CONFIG}"
+    return 1
+}
+
+_verify_driver_binding() {
+    local driver="${1}"
+
+    vfio-manage verify --all --driver $driver
+    return ${?}
 }
 
 # Only return 'paused-*' if the value passed in is != 'false'. It should only
@@ -243,6 +259,26 @@ _fetch_current_labels() {
         fi
         echo "Current value of '${NODE_LABEL_FOR_GPU_POD_EVICTION}=${CUSTOM_OPERAND_NODE_LABEL_VALUE}'"
     fi
+
+    echo "Getting current value of the 'nvidia.com/gpu.workload.config' node label"
+    CURRENT_WORKLOAD_CONFIG=$(kubectl get nodes ${NODE_NAME} -o=jsonpath='{$.metadata.labels.nvidia\.com/gpu\.workload\.config}')
+    echo "Current value of 'nvidia.com/gpu.deploy.vgpu-device-manager=${CURRENT_WORKLOAD_CONFIG}'"
+}
+
+_is_dependent_pods_running() {
+    local phase=""
+
+    echo "Getting current phase of pod accelerator-feature-discovery"
+    phase=$(kubectl get pods -n ${OPERATOR_NAMESPACE} --field-selector "spec.nodeName=${NODE_NAME}" -l component=accelerator-feature-discovery -o jsonpath='{.items[0].status.phase}')
+    if [ "${?}" != "0" ]; then
+        echo "Unable to get the phase of pod accelerator-feature-discovery"
+        return 1
+    elif [ "${phase}" != "Running" ]; then
+        echo "Current phase of pod accelerator-feature-discovery on the node ${NODE_NAME} is ${phase}"
+        return 1
+    fi
+    echo "accelerator-feature-discovery on the node ${NODE_NAME} is ${phase}"
+    return 0
 }
 
 _evict_required_gpu_operator_components() {
@@ -309,6 +345,27 @@ _evict_all_gpu_operator_components() {
         nvidia.com/gpu.deploy.sandbox-device-plugin=$(_maybe_set_paused ${SANDBOX_PLUGIN_DEPLOYED}) \
         nvidia.com/gpu.deploy.sandbox-validator=$(_maybe_set_paused ${SANDBOX_VALIDATOR_DEPLOYED}) \
         nvidia.com/gpu.deploy.vgpu-device-manager=$(_maybe_set_paused ${VGPU_DEVICE_MANAGER_DEPLOYED})
+
+    if [ "$?" != "0" ]; then
+        return 1
+    fi
+
+    echo "Shutting down gpu-config-daemon by disabling their component-specific nodeSelector labels in NodeFeatureRule"
+    cat <<EOF | kubectl apply -f -
+apiVersion: nfd.k8s-sigs.io/v1alpha1
+kind: NodeFeatureRule
+metadata:
+  name: gpu-driver-${NODE_NAME}
+spec:
+  rules:
+  - name: "gpu driver"
+    labels:
+      ecns.easystack.io/gpu.driver: paused-for-driver-switch
+    matchFeatures:
+    - feature: system.name
+      matchExpressions:
+        nodename: {op: In, value: ["${NODE_NAME}"]}
+EOF
 
     if [ "$?" != "0" ]; then
         return 1
@@ -412,6 +469,12 @@ _evict_all_gpu_operator_components() {
             -l app=nvidia-vgpu-device-manager
     fi
 
+    echo "Waiting for gpu-config-daemon to shutdown"
+    kubectl wait --for=delete pod \
+        --timeout=5m \
+        --field-selector "spec.nodeName=${NODE_NAME}" \
+        -n "${OPERATOR_NAMESPACE}" \
+        -l component=gpu-config-daemon
 
     return 0
 }
@@ -570,20 +633,41 @@ _wait_for_mofed_driver() {
     done
 }
 
-uninstall_driver() {
-    # don't attempt to un-install if driver is pre-installed on the node
-    if _host_driver; then
-        echo "NVIDIA GPU driver is already pre-installed on the node, disabling the containerized driver on the node"
-        kubectl label --overwrite \
-          node ${NODE_NAME} \
-          nvidia.com/gpu.deploy.driver=pre-installed
-        # add wait here as pod termination can take 30s due to default grace-period
-        sleep 60
-        exit 1
-    fi
+switch_driver() {
+    while true; do
+        if _is_dependent_pods_running; then
+            echo "All dependencies ready"
+            break
+        else
+            echo "Some dependencies not ready"
+        fi
+        sleep 10
+    done
 
     # fetch current status of all component labels
     _fetch_current_labels
+
+    if _is_vm_passthrough_enabled; then
+        if _verify_driver_binding "vfio-pci"; then
+          echo "There is no need to switch gpu driver from all devices"
+          exit 0
+        fi
+    else
+       if _verify_driver_binding "nvidia"; then
+          echo "There is no need to restore gpu driver from all devices"
+          exit 0
+        fi
+    fi
+
+    if [ "$RESTORE_TO_NVIDIA" == "true" ]; then
+        vfio-manage restore --all
+        if [ "$?" != "0" ]; then
+            echo "Unable to restore driver from all devices"
+            _exit_failed
+        fi
+        echo "Successfully restore nvidia driver"
+        exit 0
+    fi
 
     # fetch auto upgrade policy annotation
     _fetch_auto_upgrade_annotation
@@ -611,31 +695,9 @@ uninstall_driver() {
         fi
     fi
 
-
-    # check if driver is already loaded
-    if _driver_loaded; then
-        _cleanup_driver
-        if [ "$?" != "0" ]; then
-            if _is_auto_drain_enabled; then
-                echo "Unable to cleanup driver modules, attempting again with node drain..."
-                trap '_exit_failed' ERR
-                _drain_k8s_node
-                _cleanup_driver
-            else
-                echo "Failed to uninstall nvidia driver components"
-                _exit_failed
-            fi
-        fi
-        echo "Successfully uninstalled nvidia driver components"
-    fi
-
-    # If vfio-pci driver is in use, ensure we unbind it from all devices.
-    # If vfio-pci driver is not in use and we have reached this point, all
-    # devices will not be bound to any driver, so the below unbind operation
-    # will be a no-op.
-    vfio-manage unbind --all
+    vfio-manage bind --all
     if [ "$?" != "0" ]; then
-        echo "Unable to unbind vfio-pci driver from all devices"
+        echo "Unable to switch driver from all devices"
         _exit_failed
     fi
 
@@ -772,7 +834,7 @@ usage() {
 Usage: $0 COMMAND [ARG...]
 
 Commands:
-  uninstall_driver
+  switch_driver [-r | --restore]
   preflight_check
 EOF
     exit 1
@@ -783,7 +845,7 @@ if [ $# -eq 0 ]; then
 fi
 command=$1; shift
 case "${command}" in
-    uninstall_driver) ;;
+    switch_driver) options=$(getopt -o r --long restore -- "$@");;
     preflight_check) ;;
     *) usage ;;
 esac
@@ -791,4 +853,16 @@ if [ $? -ne 0 ]; then
     usage
 fi
 
+eval set -- "${options}"
+
+for opt in ${options}; do
+    case "$opt" in
+    -r | --restore) RESTORE_TO_NVIDIA=true; shift 1 ;;
+    -h | --help) shift;;
+    --) shift; break ;;
+    esac
+done
+if [ $# -ne 0 ]; then
+    usage
+fi
 $command
