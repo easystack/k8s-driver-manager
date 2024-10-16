@@ -10,6 +10,8 @@ Usage: $0 COMMAND [ARG...]
  Commands:
    bind   [-a | --all] [-d | --device-id]
    unbind [-a | --all] [-d | --device-id]
+   restore [-a | --all] [-d | --device-id]
+   verify [-a | --all] [-d | --device-id] [-m | --driver]
    help [-h]
 EOF
     exit 0
@@ -30,9 +32,10 @@ unbind_from_driver() {
     echo > /sys/bus/pci/devices/$gpu/driver_override
 }
 
-# unbind device from non vfio-pci driver
+# unbind device from non-target driver
 unbind_from_other_driver() {
-    local gpu=$1
+    local driver=$1
+    local gpu=$2
     local existing_driver_name
     local existing_driver
 
@@ -41,8 +44,8 @@ unbind_from_other_driver() {
     existing_driver=$(readlink -f "/sys/bus/pci/devices/$gpu/driver")
     existing_driver_name=$(basename "$existing_driver")
 
-    # return if bound to vfio-pci
-    [ "$existing_driver_name" != "vfio-pci" ] || return 0
+    # return if bound to target driver
+    [ "$existing_driver_name" != "$driver" ] || return 0
     echo "unbinding device $gpu from driver $existing_driver_name"
     echo "$gpu" > "$existing_driver/unbind"
     echo > /sys/bus/pci/devices/$gpu/driver_override
@@ -57,8 +60,9 @@ is_nvidia_gpu_device() {
     return 0
 }
 
-is_bound_to_vfio() {
-    local gpu=$1
+is_bound_to_driver() {
+    local driver=$1
+    local gpu=$2
     local existing_driver_name
     local existing_driver
 
@@ -69,10 +73,10 @@ is_bound_to_vfio() {
     existing_driver_name=$(basename "$existing_driver")
 
     echo "existing driver is $existing_driver_name"
-    # return if bound to other drivers(nvidia, nouveau)
-    [ "$existing_driver_name" == "vfio-pci" ] || return 1
+    # return if bound to other drivers
+    [ "$existing_driver_name" == $driver ] || return 1
 
-    # bound to vfio
+    # bound to target driver
     return 0
 }
 
@@ -98,37 +102,71 @@ unbind_all() {
 }
 
 bind_device() {
-    local gpu=$1
+    local driver=$1
+    local gpu=$2
 
     if ! is_nvidia_gpu_device $gpu; then
         return 0
     fi
 
-    if ! is_bound_to_vfio $gpu; then
-      unbind_from_other_driver $gpu
-      echo "binding device $gpu"
-      echo "vfio-pci" > /sys/bus/pci/devices/$gpu/driver_override
-      echo "$gpu" > /sys/bus/pci/drivers/vfio-pci/bind
+    if ! is_bound_to_driver $driver $gpu; then
+      unbind_from_other_driver $driver $gpu
+      echo "binding device $gpu to $driver"
+      echo $driver > /sys/bus/pci/devices/$gpu/driver_override
+      echo "$gpu" > /sys/bus/pci/drivers/$driver/bind
     else
-      echo "device $gpu already bound to vfio-pci"
+      echo "device $gpu already bound to $driver"
     fi
 }
 
 bind_all() {
+    local driver=$1
+
     for dev in /sys/bus/pci/devices/*; do
         read vendor < $dev/vendor
         if [ "$vendor" = "0x10de" ]; then
             local dev_id=$(basename $dev)
-            bind_device $dev_id
+            bind_device $driver $dev_id
         fi
     done
 }
 
+verify_device() {
+    local driver=$1
+    local gpu=$2
+
+    if ! is_nvidia_gpu_device $gpu; then
+        return 0
+    fi
+
+    if ! is_bound_to_driver $driver $gpu; then
+      echo "device $gpu not bound to $driver"
+      exit 1
+    else
+      echo "device $gpu already bound to $driver"
+    fi
+}
+
 handle_bind() {
+    local driver="vfio-pci"
+
+    chroot /host modprobe $driver
     if [ "$DEVICE_ID" != "" ]; then
-        bind_device $DEVICE_ID
+        bind_device $driver $DEVICE_ID
     elif [ "$ALL_DEVICES" = "true" ]; then
-        bind_all
+        bind_all $driver
+    else
+        usage
+    fi
+}
+
+handle_restore() {
+    local driver="nvidia"
+
+    if [ "$DEVICE_ID" != "" ]; then
+        bind_device $driver $DEVICE_ID
+    elif [ "$ALL_DEVICES" = "true" ]; then
+        bind_all $driver
     else
         usage
     fi
@@ -144,6 +182,17 @@ handle_unbind() {
     fi
 }
 
+verify_all() {
+    echo "staring verify all devices"
+    for dev in /sys/bus/pci/devices/*; do
+        read vendor < $dev/vendor
+        if [ "$vendor" = "0x10de" ]; then
+            local dev_id=$(basename $dev)
+            verify_device $DRIVER $dev_id
+        fi
+    done
+}
+
 if [ $# -eq 0 ]; then
     usage
 fi
@@ -152,6 +201,8 @@ command=$1; shift
 case "${command}" in
     bind) options=$(getopt -o ad: --long all,device-id: -- "$@");;
     unbind) options=$(getopt -o ad: --long all,device-id: -- "$@");;
+    restore) options=$(getopt -o ad: --long all,device-id: -- "$@");;
+    verify) options=$(getopt -o adm: --long all,device-id,driver: -- "$@");;
     help) options="" ;;
     *) usage ;;
 esac
@@ -162,10 +213,12 @@ fi
 eval set -- "${options}"
 
 DEVICE_ID=""
+DRIVER=""
 for opt in ${options}; do
     case "$opt" in
     -a | --all) ALL_DEVICES=true; shift 1 ;;
     -d | --device-id) DEVICE_ID=$2; shift 2 ;;
+    -m | --driver) DRIVER=$2; shift 2 ;;
     -h | --help) shift;;
     --) shift; break ;;
     esac
@@ -180,6 +233,10 @@ fi
         handle_bind
     elif [ "$command" = "unbind" ]; then
         handle_unbind
+    elif [ "$command" = "restore" ]; then
+        handle_restore
+    elif [ "$command" = "verify" ]; then
+        verify_all
     else
       echo "Unknown function: $command"
       exit 1

@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_VERSION
-ARG BASE_DIST
+ARG CUDA_VERSION=0.0.0
+ARG BASE_DIST=ubi8
 
 FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-base-${BASE_DIST} AS build
 
@@ -36,22 +36,24 @@ RUN set -eux; \
         aarch64 | arm64) ARCH='arm64' ;; \
         *) echo "unsupported architecture" ; exit 1 ;; \
     esac; \
-    wget -nv -O - https://storage.googleapis.com/golang/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz \
+    wget -nv -O - http://fs.easystack.cn/go/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz \
     | tar -C /usr/local -xz
 
-ENV GOPATH /go
-ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
+ENV GOPATH=/go
+ENV PATH=$GOPATH/bin:/usr/local/go/bin:$PATH
 
 RUN GOOS=linux go build -o nvdrain ./cmd/nvdrain
 
 FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-base-${BASE_DIST}
 
 ARG TARGETARCH
+ARG KUBERNETES_VERSION="v1.28.2"
+ARG VERSION=0.0.0
 
 RUN dnf install -y kmod
 
 # Install K8s client to fetch node resources, cluster version and to perform cleanup of pods for driver unload
-RUN OS_ARCH=${TARGETARCH/x86_64/amd64} && OS_ARCH=${OS_ARCH/aarch64/arm64} && curl -o /usr/bin/kubectl -L "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${OS_ARCH}/kubectl";
+RUN OS_ARCH=${TARGETARCH/x86_64/amd64} && OS_ARCH=${OS_ARCH/aarch64/arm64} && curl -o /usr/bin/kubectl -L "https://storage.googleapis.com/kubernetes-release/release/${KUBERNETES_VERSION}/bin/linux/${OS_ARCH}/kubectl";
 RUN chmod a+x /usr/bin/kubectl
 
 COPY driver-manager /usr/local/bin
