@@ -28,8 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	cmdutil "k8s.io/kubectl/pkg/cmd/util"
-	"k8s.io/kubectl/pkg/drain"
 )
 
 var (
@@ -164,84 +162,31 @@ func nvdrainWrapper(c *cli.Context, f *flags) error {
 		return fmt.Errorf("error building kubernetes clientset from config: %s", err)
 	}
 
-	timeout, err := time.ParseDuration(f.timeout)
-	if err != nil {
-		return fmt.Errorf("error parsing --timeout flag: %v", err)
-	}
+	for {
+		log.Infof("Waitting for GPU pods to be deleted")
 
-	customDrainFilter := func(pod corev1.Pod) drain.PodDeleteStatus {
-		deletePod := gpuPodSpecFilter(pod)
-		if !deletePod {
-			return drain.MakePodDeleteStatusSkip()
+		// List all pods
+		podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{ResourceVersion: "0", FieldSelector: "spec.nodeName=" + f.nodeName})
+		if err != nil {
+			return fmt.Errorf("failed to list pods: %v", err)
 		}
-		return drain.MakePodDeleteStatusOkay()
-	}
 
-	drainHelper := drain.Helper{
-		Ctx:                 ctx,
-		Client:              clientset,
-		Out:                 os.Stdout,
-		ErrOut:              os.Stderr,
-		ChunkSize:           cmdutil.DefaultChunkSize,
-		GracePeriodSeconds:  f.gracePeriodSeconds,
-		IgnoreAllDaemonSets: true,
-		DeleteEmptyDirData:  f.deleteEmptyDirData,
-		Force:               f.force,
-		Timeout:             timeout,
-		AdditionalFilters:   []drain.PodFilter{customDrainFilter},
-	}
-
-	log.Infof("Identifying GPU pods to delete")
-
-	// List all pods
-	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + f.nodeName})
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %v", err)
-	}
-
-	// Get number of GPU pods on the node which require deletion
-	numPodsToDelete := 0
-	for _, pod := range podList.Items {
-		if gpuPodSpecFilter(pod) {
-			numPodsToDelete += 1
+		// Get number of GPU pods on the node which require deletion
+		numPodsToDelete := 0
+		for _, pod := range podList.Items {
+			if gpuPodSpecFilter(pod) {
+				log.Infof("Pod %s/%s need to be deleted", pod.Namespace, pod.Name)
+				numPodsToDelete += 1
+			}
 		}
-	}
 
-	if numPodsToDelete == 0 {
-		log.Infof("No GPU pods to delete. Exiting.")
-		return nil
-	}
-
-	podDeleteList, errs := drainHelper.GetPodsForDeletion(f.nodeName)
-	numPodsCanDelete := len(podDeleteList.Pods())
-	if numPodsCanDelete != numPodsToDelete {
-		log.Error("Cannot delete all GPU pods")
-		for _, err := range errs {
-			log.Errorf("error reported by drain helper: %v", err)
+		if numPodsToDelete == 0 {
+			log.Infof("No GPU pods to delete. Exiting.")
+			return nil
 		}
-		return fmt.Errorf("Failed to delete all GPU pods")
-	}
 
-	for _, p := range podDeleteList.Pods() {
-		log.Infof("GPU pod - %s/%s", p.Namespace, p.Name)
+		time.Sleep(time.Second * 10)
 	}
-
-	warnings := podDeleteList.Warnings()
-	if warnings != "" {
-		log.Debugf("Warnings while identifying pods to delete: %s", warnings)
-	}
-
-	if f.dryRun {
-		return nil
-	}
-
-	log.Info("Deleting GPU pods...")
-	err = drainHelper.DeleteOrEvictPods(podDeleteList.Pods())
-	if err != nil {
-		return fmt.Errorf("Failed to delete all GPU pods: %v", err)
-	}
-
-	return nil
 }
 
 func gpuPodSpecFilter(pod corev1.Pod) bool {
